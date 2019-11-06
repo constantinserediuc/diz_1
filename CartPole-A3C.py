@@ -11,20 +11,17 @@
 import numpy as np
 import tensorflow as tf
 
-import gym, time, random, threading
+import time, random, threading
 
 from keras.models import *
 from keras.layers import *
 from keras import backend as K
 
-# -- constants
 from PixelDrawEnv import PixelDrawEnv
 
-ENV = 'CartPole-v0'
-
-RUN_TIME = 500
-THREADS = 6
-OPTIMIZERS = 2
+RUN_TIME = 1000
+THREADS = 10
+OPTIMIZERS = 3
 THREAD_DELAY = 0.001
 
 GAMMA = 0.99
@@ -53,46 +50,60 @@ class Brain:
         K.manual_variable_initialization(True)
 
         self.model = self._build_model()
+        self.model.summary()
         self.graph = self._build_graph(self.model)
 
         self.session.run(tf.global_variables_initializer())
         self.default_graph = tf.get_default_graph()
 
-        self.default_graph.finalize()  # avoid modifications
+        # self.default_graph.finalize()  # avoid modifications
 
     def _build_model(self):
 
-        l_input = Input(batch_shape=(None,28,28,1))
-        l_dense = Conv2D(32, padding="same",kernel_size=(3, 3),activation='relu')(l_input)
-        l_dense = Conv2D(64, (3, 3), padding="same",activation='relu')(l_dense)
-        # l_dense = MaxPooling2D(pool_size=(2, 2))(l_dense)
-        # l_dense = Conv2D(16, padding="same",kernel_size=(3, 3),activation='relu')(l_dense)
+        l_image_input = Input(batch_shape=(None, 28, 28, 1))
+        l_dense = Conv2D(32, padding="same", kernel_size=(3, 3), activation='relu')(l_image_input)
+        # l_dense = Conv2D(32, padding="same", kernel_size=(3, 3), activation='relu')(l_dense)
+        l_image_flatten = Flatten()(l_dense)
+        l_dense = BatchNormalization()(l_image_flatten)
+        model_image = Model(inputs=[l_image_input], outputs=[l_dense])
+
+        l_image_input = Input(batch_shape=(None, 28, 28, 1))
+        l_dense = Conv2D(32, padding="same", kernel_size=(3, 3), activation='relu')(l_image_input)
+        # l_dense = Conv2D(32, padding="same", kernel_size=(3, 3), activation='relu')(l_dense)
+        l_image_flatten = Flatten()(l_dense)
+        l_dense = BatchNormalization()(l_image_flatten)
         # l_dense = Dropout(0.5)(l_dense)
-        l_dense = Flatten()(l_dense)
-        # l_dense = Dense(128, activation='relu')(l_dense)
-        l_dense = Dropout(0.5)(l_dense)
-        # l_dense = Dense(16, activation='relu')(l_input)
-        # l_dense = Dropout(0.2)(l_dense)
+
+        model_image_target = Model(inputs=[l_image_input], outputs=[l_dense])
+
+        l_position_input = Input(batch_shape=(None, 1, 2))
+        l_dense = Flatten()(l_position_input)
+        l_dense = Dense(32, activation='relu')(l_dense)
+        l_dense = BatchNormalization()(l_dense)
+        position_model = Model(inputs=[l_position_input], outputs=[l_dense])
+
+        combined = concatenate([model_image.output, model_image_target.output, position_model.output])
+
+        l_dense = Dense(32, activation='relu')(combined)
         # l_dense = Dense(32, activation='relu')(l_dense)
-        # l_dense = Dropout(0.6)(l_dense)
-        # l_dense = Dense(64, activation='relu')(l_dense)
-        # l_dense = Dropout(0.6)(l_dense)
-        # l_dense = Dense(128, activation='relu')(l_dense)
-        # l_dense = Dropout(0.5)(l_dense)
+        l_dense = Dropout(0.5)(l_dense)
         out_actions = Dense(NUM_ACTIONS, activation='softmax')(l_dense)
         out_value = Dense(1, activation='linear')(l_dense)
 
-        model = Model(inputs=[l_input], outputs=[out_actions, out_value])
+        model = Model(inputs=[model_image.input, model_image_target.input, position_model.input],
+                      outputs=[out_actions, out_value])
         model._make_predict_function()  # have to initialize before threading
 
         return model
 
     def _build_graph(self, model):
-        s_t = tf.placeholder(tf.float32, shape=(None,28,28,1))
+        s_t_i = tf.placeholder(tf.float32, shape=(None, 28, 28, 1))
+        s_t_t = tf.placeholder(tf.float32, shape=(None, 28, 28, 1))
+        s_t_p = tf.placeholder(tf.float32, shape=(None, 1, 2))
         a_t = tf.placeholder(tf.float32, shape=(None, NUM_ACTIONS))
         r_t = tf.placeholder(tf.float32, shape=(None, 1))  # not immediate, but discounted n step reward
 
-        p, v = model(s_t)
+        p, v = model([s_t_i, s_t_t, s_t_p])
 
         log_prob = tf.log(tf.reduce_sum(p * a_t, axis=1, keep_dims=True) + 1e-10)
         advantage = r_t - v
@@ -107,7 +118,7 @@ class Brain:
         optimizer = tf.train.RMSPropOptimizer(LEARNING_RATE, decay=.99)
         minimize = optimizer.minimize(loss_total)
 
-        return s_t, a_t, r_t, minimize
+        return s_t_i, s_t_t, s_t_p, a_t, r_t, minimize
 
     def optimize(self):
         if len(self.train_queue[0]) < MIN_BATCH:
@@ -126,14 +137,20 @@ class Brain:
         r = np.vstack(r)
         s_ = np.array(s_)
         s_mask = np.vstack(s_mask)
-
         if len(s) > 5 * MIN_BATCH: print("Optimizer alert! Minimizing batch of %d" % len(s))
-
-        v = self.predict_v(s_)
+        s_batch, p_batch, t_batch = [], [], []
+        for i in s_:
+            s_batch.append(i[0])
+            t_batch.append(i[1])
+            p_batch.append(i[2])
+        s_batch = np.array(s_batch)
+        p_batch = np.array(p_batch)
+        t_batch = np.array(t_batch)
+        v = self.predict_v([s_batch, t_batch, p_batch])
         r = r + GAMMA_N * v * s_mask  # set v to 0 where s_ is terminal state
 
-        s_t, a_t, r_t, minimize = self.graph
-        self.session.run(minimize, feed_dict={s_t: s, a_t: a, r_t: r})
+        s_t_i, s_p_t, s_t_p, a_t, r_t, minimize = self.graph
+        self.session.run(minimize, feed_dict={s_t_i: s_batch, s_p_t: t_batch, s_t_p: p_batch, a_t: a, r_t: r})
 
     def train_push(self, s, a, r, s_):
         with self.lock_queue:
@@ -155,7 +172,7 @@ class Brain:
 
     def predict_p(self, s):
         with self.default_graph.as_default():
-            p, v = self.model.predict(s)
+            p, v = self.model.predict(s)  # [s,np.array([[1,2]])]
             return p
 
     def predict_v(self, s):
@@ -192,8 +209,9 @@ class Agent:
             return random.randint(0, NUM_ACTIONS - 1)
 
         else:
-            s = np.array([s])
-            p = brain.predict_p(s)[0]
+            # s = np.array([s])
+            ss = [np.expand_dims(s[0], axis=0), np.expand_dims(s[1], axis=0), np.expand_dims(s[2], axis=0)]
+            p = brain.predict_p(ss)[0]
 
             # a = np.argmax(p)
             a = np.random.choice(NUM_ACTIONS, p=p)
@@ -271,7 +289,7 @@ class Environment(threading.Thread):
             if done or self.stop_signal:
                 with open('rewards.txt', 'a') as a_writer:
                     a_writer.write(str(R) + '\n')
-                if R >10000:
+                if R > 100:
                     self.env.render()
                 break
 
